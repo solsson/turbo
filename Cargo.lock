@@ -7546,6 +7546,7 @@ dependencies = [
  "turborepo-task-id",
  "turborepo-turbo-json",
  "turborepo-types",
+ "wax",
  "which",
 ]
 

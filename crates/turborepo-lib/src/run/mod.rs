@@ -972,6 +972,14 @@ impl Run {
 
         let env_mode = self.opts.run_opts.env_mode;
 
+        // Detect tasks that need deferred file hashing — their inputs
+        // match outputs from dependency tasks. These will be hashed at
+        // dispatch time after dependencies have executed.
+        let overlaps =
+            turborepo_engine::dep_output_overlap::detect_dep_output_overlaps(&self.engine);
+        let deferred_hash_tasks =
+            turborepo_engine::dep_output_overlap::deferred_hash_tasks(&overlaps);
+
         let mut file_hash_result = None;
         let mut internal_deps_result = None;
         let mut global_file_result = None;
@@ -1102,6 +1110,8 @@ impl Run {
             ui_sender,
             is_watch,
             self.micro_frontend_configs.as_ref(),
+            deferred_hash_tasks,
+            &self.scm,
         )
         .await;
 

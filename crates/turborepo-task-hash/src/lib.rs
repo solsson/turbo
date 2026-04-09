@@ -218,7 +218,6 @@ impl PackageInputsHashes {
             let file_hashes = &file_hash_results[key_idx];
 
             let hash = file_hashes.as_ref().hash();
-
             hashes.insert(info.task_id.clone(), hash);
             if needs_expanded_hashes {
                 expanded_hashes.insert(info.task_id, Arc::clone(file_hashes));
@@ -254,7 +253,7 @@ pub struct TaskHashTrackerState {
 
 /// Caches package-inputs hashes, and package-task hashes.
 pub struct TaskHasher<'a, R> {
-    hashes: HashMap<TaskId<'static>, String>,
+    hashes: RwLock<HashMap<TaskId<'static>, String>>,
     run_opts: &'a R,
     env_at_execution_start: &'a EnvironmentVariableMap,
     global_env: EnvironmentVariableMap,
@@ -286,7 +285,7 @@ impl<'a, R: RunOptsHashInfo> TaskHasher<'a, R> {
             });
 
         Self {
-            hashes,
+            hashes: RwLock::new(hashes),
             run_opts,
             env_at_execution_start,
             global_hash,
@@ -319,6 +318,20 @@ impl<'a, R: RunOptsHashInfo> TaskHasher<'a, R> {
             .collect();
     }
 
+    /// Replace the pre-computed file hash for a task. Used for deferred
+    /// hashing: tasks whose inputs include dependency outputs get their
+    /// file hash re-computed after the dependency has executed and the
+    /// output files actually exist on disk.
+    /// Replace the pre-computed file hash for a task. Used for deferred
+    /// hashing when a task's inputs include dependency outputs that only
+    /// exist after the dependency has executed.
+    pub fn update_file_hash(&self, task_id: &TaskId<'static>, hash: String) {
+        self.hashes
+            .write()
+            .expect("file hashes lock poisoned")
+            .insert(task_id.clone(), hash);
+    }
+
     #[tracing::instrument(skip(self, task_definition, task_env_mode, workspace, dependency_set))]
     pub fn calculate_task_hash<T: TaskDefinitionHashInfo>(
         &self,
@@ -332,8 +345,8 @@ impl<'a, R: RunOptsHashInfo> TaskHasher<'a, R> {
         let do_framework_inference = self.run_opts.framework_inference();
         let is_monorepo = !self.run_opts.single_package();
 
-        let hash_of_files = self
-            .hashes
+        let hashes = self.hashes.read().expect("file hashes lock poisoned");
+        let hash_of_files = hashes
             .get(task_id)
             .ok_or_else(|| Error::MissingPackageFileHash(task_id.to_string()))?;
         // See if we can infer a framework

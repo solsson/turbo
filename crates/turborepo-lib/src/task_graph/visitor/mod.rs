@@ -61,6 +61,10 @@ pub struct Visitor<'a> {
     ui_sender: Option<UISender>,
     warnings: Arc<Mutex<Vec<TaskWarning>>>,
     micro_frontends_configs: Option<&'a MicrofrontendsConfigs>,
+    /// Tasks whose file hashes must be re-computed after dependencies execute.
+    /// These are tasks whose inputs match a dependency's outputs.
+    deferred_hash_tasks: HashSet<TaskId<'static>>,
+    scm: &'a SCM,
 }
 
 #[derive(Debug, thiserror::Error, Diagnostic)]
@@ -133,6 +137,8 @@ impl<'a> Visitor<'a> {
         ui_sender: Option<UISender>,
         is_watch: bool,
         micro_frontends_configs: Option<&'a MicrofrontendsConfigs>,
+        deferred_hash_tasks: HashSet<TaskId<'static>>,
+        scm: &'a SCM,
     ) -> Self {
         let (task_hasher, color_cache, grouping_layer) = {
             let _span = tracing::info_span!("visitor_new").entered();
@@ -191,6 +197,8 @@ impl<'a> Visitor<'a> {
             is_watch,
             warnings: Default::default(),
             micro_frontends_configs,
+            deferred_hash_tasks,
+            scm,
         }
     }
 
@@ -256,6 +264,13 @@ impl<'a> Visitor<'a> {
                         return Ok(None);
                     };
 
+                    // Skip tasks that need deferred hashing — their file
+                    // inputs depend on outputs from dependencies that haven't
+                    // executed yet. They'll be hashed at dispatch time.
+                    if self.deferred_hash_tasks.contains(task_id) {
+                        return Ok(None);
+                    };
+
                     let package_name = PackageName::from(task_id.package());
                     let workspace_info = self
                         .package_graph
@@ -310,6 +325,71 @@ impl<'a> Visitor<'a> {
             .expect("all wave references dropped")
             .into_inner()
             .expect("mutex not poisoned"))
+    }
+
+    /// Compute file hash and task hash for a deferred task. Called at
+    /// dispatch time when all dependencies have executed and their output
+    /// files exist on disk.
+    fn compute_deferred_hash(
+        &self,
+        task_id: &TaskId<'static>,
+        task_definition: &turborepo_types::TaskDefinition,
+        workspace_info: &turborepo_repository::package_graph::PackageInfo,
+        engine: &Engine,
+        telemetry: &GenericEventBuilder,
+    ) -> Result<(String, EnvironmentVariableMap), Error> {
+        use turborepo_hash::TurboHash;
+
+        // Re-compute file hash — the dependency's output files now exist.
+        let package_path = workspace_info
+            .package_json_path
+            .parent()
+            .unwrap_or_else(|| AnchoredSystemPath::new("").unwrap());
+        let inputs = &task_definition.inputs;
+        let file_hashes = self
+            .scm
+            .get_package_file_hashes(
+                self.repo_root,
+                package_path,
+                &inputs.globs,
+                inputs.default,
+                None,
+                None,
+            )
+            .map_err(|e| Error::TaskHash(task_hash::Error::Scm(e)))?;
+
+        let mut sorted: Vec<_> = file_hashes.into_iter().collect();
+        sorted.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        let hash = turborepo_hash::FileHashes(sorted).hash();
+
+        // Update the file hash in the TaskHasher. The hashes field uses
+        // RwLock so this is safe through &self.
+        self.task_hasher.update_file_hash(task_id, hash.clone());
+
+        debug!(
+            "deferred hash for {}: file hash recomputed to {}",
+            task_id, hash
+        );
+
+        let task_env_mode = task_definition.env_mode.unwrap_or(self.global_env_mode);
+        let dependency_set = engine
+            .dependencies(task_id)
+            .ok_or(Error::MissingDefinition)?;
+        let package_task_event =
+            PackageTaskEventBuilder::new(task_id.package(), task_id.task()).with_parent(telemetry);
+        let task_hash = self.task_hasher.calculate_task_hash(
+            task_id,
+            task_definition,
+            task_env_mode,
+            workspace_info,
+            &dependency_set,
+            package_task_event.child(),
+        )?;
+        let execution_env = self
+            .task_hasher
+            .env(task_id, task_env_mode, task_definition)?;
+
+        Ok((task_hash, execution_env))
     }
 
     #[tracing::instrument(skip_all)]
@@ -401,7 +481,25 @@ impl<'a> Visitor<'a> {
 
             // Move pre-computed hash and env out of the map — each task is
             // dispatched exactly once, so remove avoids cloning the env map.
-            let Some((task_hash, execution_env)) = precomputed.remove(&info) else {
+            // For deferred tasks (whose inputs match dependency outputs),
+            // the hash is computed here after dependencies have executed.
+            let (task_hash, execution_env) = if let Some(result) = precomputed.remove(&info) {
+                result
+            } else if self.deferred_hash_tasks.contains(&info) {
+                match self.compute_deferred_hash(
+                    &info,
+                    task_definition,
+                    workspace_info,
+                    &engine,
+                    telemetry,
+                ) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        dispatch_error = Some(e);
+                        break;
+                    }
+                }
+            } else {
                 dispatch_error = Some(Error::MissingDefinition);
                 break;
             };

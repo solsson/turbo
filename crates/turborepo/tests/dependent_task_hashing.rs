@@ -174,3 +174,50 @@ fn test_dependent_task_hashing_changing_output() {
         "Run 2 must NOT be FULL TURBO.\nstdout: {stdout}"
     );
 }
+
+/// A non-deferred task (checks) depends on a deferred task (schemas).
+/// This must not crash and should cache correctly on the second run.
+#[test]
+fn test_dependent_task_hashing_depends_on_deferred() {
+    let tempdir = tempfile::tempdir().unwrap();
+    setup::setup_integration_test(tempdir.path(), "dependent_task_hashing", "npm@10.5.0", true)
+        .unwrap();
+
+    // Run 1: all three tasks (prepare, schemas, checks) miss
+    let output = run_turbo(
+        tempdir.path(),
+        &[
+            "run",
+            "checks",
+            "--output-logs=none",
+            "--filter=depends-on-deferred",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("0 cached, 3 total"),
+        "Run 1 should have 0 cached tasks.\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Run 2: all should cache
+    let output = run_turbo(
+        tempdir.path(),
+        &[
+            "run",
+            "checks",
+            "--output-logs=none",
+            "--filter=depends-on-deferred",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("3 cached, 3 total"),
+        "Run 2 should have 3 cached tasks (FULL TURBO).\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("FULL TURBO"),
+        "Run 2 should report FULL TURBO.\nstdout: {stdout}"
+    );
+}

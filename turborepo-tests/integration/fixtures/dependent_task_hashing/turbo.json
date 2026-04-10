@@ -3,6 +3,8 @@
   "tasks": {
     "prepare": {},
     "transform": {},
-    "build": {}
+    "build": {},
+    "schemas": {},
+    "checks": {}
   }
 }

@@ -533,10 +533,12 @@ impl<'a> Visitor<'a> {
 
             debug!("task {} hash is {}", info, task_hash);
 
-            // For deferred tasks, mark the hash as <DEFERRED> in the
-            // summary/dry-run output. The real hash is still used for
-            // cache operations via task_cache.
-            if self.deferred_hash_tasks.contains(&info) {
+            // In dry mode, deferred tasks haven't had their dependencies
+            // execute, so the hash is based on stale file state. Mark it
+            // in the tracker so dry run output shows <DEFERRED> instead
+            // of a misleading hash. In non-dry mode the hash is correct
+            // (deps executed) and the tracker keeps the real value.
+            if self.dry && self.deferred_hash_tasks.contains(&info) {
                 self.task_hasher
                     .task_hash_tracker()
                     .set_hash(&info, "<DEFERRED>");

@@ -618,6 +618,15 @@ impl TaskHashTracker {
         state.package_task_hashes.get(task_id).cloned()
     }
 
+    /// Overwrite a task's hash in the tracker. Used to mark deferred tasks
+    /// with a placeholder in the summary output.
+    pub fn set_hash(&self, task_id: &TaskId<'static>, hash: &str) {
+        let mut state = self.state.write().expect("hash tracker rwlock poisoned");
+        state
+            .package_task_hashes
+            .insert(task_id.clone(), Arc::from(hash));
+    }
+
     fn insert_hash(
         &self,
         task_id: TaskId<'static>,

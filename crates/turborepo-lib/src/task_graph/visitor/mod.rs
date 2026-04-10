@@ -533,6 +533,15 @@ impl<'a> Visitor<'a> {
 
             debug!("task {} hash is {}", info, task_hash);
 
+            // For deferred tasks, mark the hash as <DEFERRED> in the
+            // summary/dry-run output. The real hash is still used for
+            // cache operations via task_cache.
+            if self.deferred_hash_tasks.contains(&info) {
+                self.task_hasher
+                    .task_hash_tracker()
+                    .set_hash(&info, "<DEFERRED>");
+            }
+
             let task_cache = {
                 let _span = tracing::info_span!("task_cache_new").entered();
                 self.run_cache

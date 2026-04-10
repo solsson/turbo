@@ -1,10 +1,12 @@
-//! Detects tasks whose inputs overlap with their dependencies' outputs.
+//! Flags tasks whose inputs overlap with their dependencies' outputs.
 //!
 //! When task B depends on task A and B's `inputs` include a file that A
 //! declares as an `output`, turbo must defer B's file hashing until after
 //! A has executed, so the output files exist on disk and hash correctly.
-
-use std::collections::HashSet;
+//!
+//! Config-level flagging identifies the turbo.json patterns. The caller
+//! decides which flagged tasks actually need deferred hashing at runtime
+//! (e.g. by checking whether the dependency task has a script).
 
 use turborepo_task_id::TaskId;
 use turborepo_types::TaskDefinition;
@@ -85,11 +87,6 @@ pub fn detect_dep_output_overlaps(engine: &Engine<Built, TaskDefinition>) -> Vec
     });
 
     overlaps
-}
-
-/// Build a set of task IDs that need deferred file hashing.
-pub fn deferred_hash_tasks(overlaps: &[DepOutputOverlap]) -> HashSet<TaskId<'static>> {
-    overlaps.iter().map(|o| o.task_id.clone()).collect()
 }
 
 /// A config-level overlap, deduplicated by task name (package stripped).

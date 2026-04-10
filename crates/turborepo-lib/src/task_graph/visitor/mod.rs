@@ -62,8 +62,9 @@ pub struct Visitor<'a> {
     warnings: Arc<Mutex<Vec<TaskWarning>>>,
     micro_frontends_configs: Option<&'a MicrofrontendsConfigs>,
     /// Tasks whose file hashes must be re-computed after dependencies execute.
-    /// Maps each deferred task to the dependency tasks that triggered it.
-    deferred_hash_tasks: HashMap<TaskId<'static>, Vec<TaskId<'static>>>,
+    /// Tasks whose inputs depend on a dependency's outputs. Maps each task
+    /// to the dependency tasks that produce the matching outputs.
+    depends_on_output_tasks: HashMap<TaskId<'static>, Vec<TaskId<'static>>>,
     scm: &'a SCM,
 }
 
@@ -137,7 +138,7 @@ impl<'a> Visitor<'a> {
         ui_sender: Option<UISender>,
         is_watch: bool,
         micro_frontends_configs: Option<&'a MicrofrontendsConfigs>,
-        deferred_hash_tasks: HashMap<TaskId<'static>, Vec<TaskId<'static>>>,
+        depends_on_output_tasks: HashMap<TaskId<'static>, Vec<TaskId<'static>>>,
         scm: &'a SCM,
     ) -> Self {
         let (task_hasher, color_cache, grouping_layer) = {
@@ -197,7 +198,7 @@ impl<'a> Visitor<'a> {
             is_watch,
             warnings: Default::default(),
             micro_frontends_configs,
-            deferred_hash_tasks,
+            depends_on_output_tasks,
             scm,
         }
     }
@@ -320,10 +321,10 @@ impl<'a> Visitor<'a> {
             .expect("mutex not poisoned"))
     }
 
-    /// Compute file hash and task hash for a deferred task. Called at
-    /// dispatch time when all dependencies have executed and their output
-    /// files exist on disk.
-    fn compute_deferred_hash(
+    /// Compute file hash and task hash for a depends-on-output task.
+    /// Called at dispatch time when all dependencies have executed and
+    /// their output files exist on disk.
+    fn compute_depends_on_output_hash(
         &self,
         task_id: &TaskId<'static>,
         task_definition: &turborepo_types::TaskDefinition,
@@ -360,7 +361,7 @@ impl<'a> Visitor<'a> {
         self.task_hasher.update_file_hash(task_id, hash.clone());
 
         debug!(
-            "deferred hash for {}: file hash recomputed to {}",
+            "depends-on-output {}: file hash recomputed to {}",
             task_id, hash
         );
 
@@ -417,9 +418,9 @@ impl<'a> Visitor<'a> {
         let span = Span::current();
 
         let factory = ExecContextFactory::new(self, errors.clone(), self.manager.clone(), &engine)?;
-        // Track tasks whose hash changed at dispatch time, so downstream
-        // tasks can detect they need re-hashing too.
-        let mut rehashed_tasks: HashSet<TaskId<'static>> = HashSet::new();
+        // Track tasks whose hash changed at dispatch time (depends-on-output),
+        // so downstream tasks can detect they also need re-hashing.
+        let mut output_changed_tasks: HashSet<TaskId<'static>> = HashSet::new();
 
         // Errors from the dispatch loop are captured here rather than returned
         // immediately. This ensures we always drain the FuturesUnordered below,
@@ -485,13 +486,13 @@ impl<'a> Visitor<'a> {
             // outputs, re-hash now that dependencies have executed and their
             // output files exist on disk. Also re-hash if any dependency was
             // itself re-hashed (its hash changed, invalidating ours).
-            let needs_rehash = self.deferred_hash_tasks.contains_key(&info)
+            let needs_output_rehash = self.depends_on_output_tasks.contains_key(&info)
                 || engine
                     .dependencies(&info)
                     .map(|deps| {
                         deps.iter().any(|d| {
                             if let turborepo_engine::TaskNode::Task(dep_id) = d {
-                                rehashed_tasks.contains(dep_id)
+                                output_changed_tasks.contains(dep_id)
                             } else {
                                 false
                             }
@@ -499,8 +500,8 @@ impl<'a> Visitor<'a> {
                     })
                     .unwrap_or(false);
 
-            let (task_hash, execution_env) = if needs_rehash {
-                match self.compute_deferred_hash(
+            let (task_hash, execution_env) = if needs_output_rehash {
+                match self.compute_depends_on_output_hash(
                     &info,
                     task_definition,
                     workspace_info,
@@ -510,15 +511,12 @@ impl<'a> Visitor<'a> {
                     Ok(result) => {
                         if result.0 != task_hash {
                             debug!(
-                                "deferred rehash for {}: hash changed {} -> {}",
+                                "depends-on-output {}: hash changed {} -> {}",
                                 info, task_hash, result.0
                             );
-                            rehashed_tasks.insert(info.clone());
+                            output_changed_tasks.insert(info.clone());
                         } else {
-                            debug!(
-                                "deferred rehash for {}: hash unchanged ({})",
-                                info, task_hash
-                            );
+                            debug!("depends-on-output {}: hash unchanged ({})", info, task_hash);
                         }
                         result
                     }
@@ -535,11 +533,11 @@ impl<'a> Visitor<'a> {
 
             // In dry mode, deferred tasks haven't had their dependencies
             // execute, so the hash is based on stale file state. Mark it
-            // In dry mode, deferred tasks haven't had their dependencies
-            // execute, so the hash is based on stale file state. Show
-            // which dependency outputs this task depends on instead.
+            // In dry mode, depends-on-output tasks haven't had their
+            // dependencies execute, so the hash is based on stale file
+            // state. Show which dependency outputs the task depends on.
             if self.dry {
-                if let Some(dep_tasks) = self.deferred_hash_tasks.get(&info) {
+                if let Some(dep_tasks) = self.depends_on_output_tasks.get(&info) {
                     let deps: Vec<_> = dep_tasks.iter().map(|d| d.to_string()).collect();
                     self.task_hasher
                         .task_hash_tracker()

@@ -1,12 +1,12 @@
 //! Flags tasks whose inputs overlap with their dependencies' outputs.
 //!
 //! When task B depends on task A and B's `inputs` include a file that A
-//! declares as an `output`, turbo must defer B's file hashing until after
-//! A has executed, so the output files exist on disk and hash correctly.
+//! declares as an `output`, B's file hashing must happen after A has
+//! executed so the output files exist on disk and hash correctly.
 //!
 //! Config-level flagging identifies the turbo.json patterns. The caller
-//! decides which flagged tasks actually need deferred hashing at runtime
-//! (e.g. by checking whether the dependency task has a script).
+//! decides which flagged tasks actually need depends-on-output hashing
+//! at runtime (e.g. by checking whether the dependency task has a script).
 
 use turborepo_task_id::TaskId;
 use turborepo_types::TaskDefinition;

@@ -34,6 +34,7 @@ pub use turborepo_run_cache::{ConfigCache, RunCache, TaskCache};
 use turborepo_run_summary::{ObservabilityHandle, RunTracker};
 use turborepo_scm::{RepoGitIndex, SCM};
 use turborepo_signals::{listeners::get_signal, SignalHandler};
+use turborepo_task_id::TaskId;
 use turborepo_telemetry::events::generic::GenericEventBuilder;
 use turborepo_types::{EnvMode, UIMode};
 use turborepo_ui::{sender::UISender, tui, tui::TuiSender, wui::sender::WebUISender, ColorConfig};
@@ -220,7 +221,7 @@ impl Run {
         )
         .emit();
 
-        // Config-level info for dependsOn output/input overlaps.
+        // Config-level flagging for dependsOn output/input overlaps.
         // Deduplicated by task name (package stripped) — informs the config
         // author that turbo.json task definitions have patterns where a
         // task's inputs match a dependency's outputs.
@@ -684,13 +685,30 @@ impl Run {
 
         let env_mode = self.opts.run_opts.env_mode;
 
-        // Detect tasks that need deferred file hashing — their inputs
-        // match outputs from dependency tasks. These will be hashed at
-        // dispatch time after dependencies have executed.
+        // Config flagging identified input/output overlaps. For the actual
+        // deferred hashing, only include tasks where the dependency task has
+        // a script — if the dep package has no script, the task is a no-op
+        // and won't produce output files, so upstream behavior is fine.
         let overlaps =
             turborepo_engine::dep_output_overlap::detect_dep_output_overlaps(&self.engine);
-        let deferred_hash_tasks =
-            turborepo_engine::dep_output_overlap::deferred_hash_tasks(&overlaps);
+        let deferred_hash_tasks: HashSet<TaskId<'static>> = overlaps
+            .iter()
+            .filter(|overlap| {
+                let dep_pkg = PackageName::from(overlap.dep_task_id.package());
+                self.pkg_dep_graph
+                    .package_info(&dep_pkg)
+                    .and_then(|info| info.package_json.scripts.get(overlap.dep_task_id.task()))
+                    .is_some()
+            })
+            .map(|o| o.task_id.clone())
+            .collect();
+
+        debug!(
+            "dep-output flagged: {} overlaps, {} tasks deferred: {:?}",
+            overlaps.len(),
+            deferred_hash_tasks.len(),
+            deferred_hash_tasks
+        );
 
         let mut file_hash_result = None;
         let mut internal_deps_result = None;

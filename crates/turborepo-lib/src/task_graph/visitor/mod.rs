@@ -509,7 +509,16 @@ impl<'a> Visitor<'a> {
                 ) {
                     Ok(result) => {
                         if result.0 != task_hash {
+                            debug!(
+                                "deferred rehash for {}: hash changed {} -> {}",
+                                info, task_hash, result.0
+                            );
                             rehashed_tasks.insert(info.clone());
+                        } else {
+                            debug!(
+                                "deferred rehash for {}: hash unchanged ({})",
+                                info, task_hash
+                            );
                         }
                         result
                     }

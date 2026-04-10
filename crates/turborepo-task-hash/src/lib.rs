@@ -322,9 +322,9 @@ impl<'a, R: RunOptsHashInfo> TaskHasher<'a, R> {
     /// hashing: tasks whose inputs include dependency outputs get their
     /// file hash re-computed after the dependency has executed and the
     /// output files actually exist on disk.
-    /// Replace the pre-computed file hash for a task. Used for deferred
-    /// hashing when a task's inputs include dependency outputs that only
-    /// exist after the dependency has executed.
+    /// Replace the pre-computed file hash for a task. Used for
+    /// depends-on-output tasks whose inputs include dependency outputs
+    /// that only exist after the dependency has executed.
     pub fn update_file_hash(&self, task_id: &TaskId<'static>, hash: String) {
         self.hashes
             .write()
@@ -624,8 +624,8 @@ impl TaskHashTracker {
         state.package_task_hashes.get(task_id).cloned()
     }
 
-    /// Overwrite a task's hash in the tracker. Used to mark deferred tasks
-    /// with a placeholder in the summary output.
+    /// Overwrite a task's hash in the tracker. Used to mark
+    /// depends-on-output tasks with a placeholder in dry run output.
     pub fn set_hash(&self, task_id: &TaskId<'static>, hash: &str) {
         let mut state = self.state.write().expect("hash tracker rwlock poisoned");
         state

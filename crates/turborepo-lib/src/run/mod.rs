@@ -973,13 +973,13 @@ impl Run {
 
         let env_mode = self.opts.run_opts.env_mode;
 
-        // Config flagging identified input/output overlaps. For the actual
-        // deferred hashing, only include tasks where the dependency task has
-        // a script — if the dep package has no script, the task is a no-op
-        // and won't produce output files, so upstream behavior is fine.
+        // Config flagging identified input/output overlaps. Build the
+        // depends-on-output set: only include tasks where the dependency
+        // task has a script — if the dep has no script, the task is a
+        // no-op and won't produce output files, so upstream behavior is fine.
         let overlaps =
             turborepo_engine::dep_output_overlap::detect_dep_output_overlaps(&self.engine);
-        let mut deferred_hash_tasks: std::collections::HashMap<
+        let mut depends_on_output_tasks: std::collections::HashMap<
             TaskId<'static>,
             Vec<TaskId<'static>>,
         > = std::collections::HashMap::new();
@@ -990,17 +990,17 @@ impl Run {
                 .and_then(|info| info.package_json.scripts.get(overlap.dep_task_id.task()))
                 .is_some()
         }) {
-            deferred_hash_tasks
+            depends_on_output_tasks
                 .entry(overlap.task_id.clone())
                 .or_default()
                 .push(overlap.dep_task_id.clone());
         }
 
         debug!(
-            "dep-output flagged: {} overlaps, {} tasks deferred: {:?}",
+            "dep-output flagged: {} overlaps, {} depends-on-output tasks: {:?}",
             overlaps.len(),
-            deferred_hash_tasks.len(),
-            deferred_hash_tasks
+            depends_on_output_tasks.len(),
+            depends_on_output_tasks
         );
 
         let mut file_hash_result = None;
@@ -1133,7 +1133,7 @@ impl Run {
             ui_sender,
             is_watch,
             self.micro_frontend_configs.as_ref(),
-            deferred_hash_tasks,
+            depends_on_output_tasks,
             &self.scm,
         )
         .await;

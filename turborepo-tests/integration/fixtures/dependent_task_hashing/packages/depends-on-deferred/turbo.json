@@ -1,0 +1,18 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "prepare": {
+      "inputs": ["package.json"],
+      "outputs": ["generated.txt"]
+    },
+    "schemas": {
+      "inputs": ["generated.txt"],
+      "dependsOn": ["prepare"]
+    },
+    "checks": {
+      "inputs": ["package.json"],
+      "dependsOn": ["schemas"]
+    }
+  }
+}

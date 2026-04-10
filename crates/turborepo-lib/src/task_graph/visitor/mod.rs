@@ -264,13 +264,6 @@ impl<'a> Visitor<'a> {
                         return Ok(None);
                     };
 
-                    // Skip tasks that need deferred hashing — their file
-                    // inputs depend on outputs from dependencies that haven't
-                    // executed yet. They'll be hashed at dispatch time.
-                    if self.deferred_hash_tasks.contains(task_id) {
-                        return Ok(None);
-                    };
-
                     let package_name = PackageName::from(task_id.package());
                     let workspace_info = self
                         .package_graph
@@ -424,6 +417,9 @@ impl<'a> Visitor<'a> {
         let span = Span::current();
 
         let factory = ExecContextFactory::new(self, errors.clone(), self.manager.clone(), &engine)?;
+        // Track tasks whose hash changed at dispatch time, so downstream
+        // tasks can detect they need re-hashing too.
+        let mut rehashed_tasks: HashSet<TaskId<'static>> = HashSet::new();
 
         // Errors from the dispatch loop are captured here rather than returned
         // immediately. This ensures we always drain the FuturesUnordered below,
@@ -479,13 +475,31 @@ impl<'a> Visitor<'a> {
                 break;
             };
 
-            // Move pre-computed hash and env out of the map — each task is
-            // dispatched exactly once, so remove avoids cloning the env map.
-            // For deferred tasks (whose inputs match dependency outputs),
-            // the hash is computed here after dependencies have executed.
-            let (task_hash, execution_env) = if let Some(result) = precomputed.remove(&info) {
-                result
-            } else if self.deferred_hash_tasks.contains(&info) {
+            // Move pre-computed hash and env out of the map.
+            let Some((task_hash, execution_env)) = precomputed.remove(&info) else {
+                dispatch_error = Some(Error::MissingDefinition);
+                break;
+            };
+
+            // Deferred hashing: if this task's inputs match a dependency's
+            // outputs, re-hash now that dependencies have executed and their
+            // output files exist on disk. Also re-hash if any dependency was
+            // itself re-hashed (its hash changed, invalidating ours).
+            let needs_rehash = self.deferred_hash_tasks.contains(&info)
+                || engine
+                    .dependencies(&info)
+                    .map(|deps| {
+                        deps.iter().any(|d| {
+                            if let turborepo_engine::TaskNode::Task(dep_id) = d {
+                                rehashed_tasks.contains(dep_id)
+                            } else {
+                                false
+                            }
+                        })
+                    })
+                    .unwrap_or(false);
+
+            let (task_hash, execution_env) = if needs_rehash {
                 match self.compute_deferred_hash(
                     &info,
                     task_definition,
@@ -493,15 +507,19 @@ impl<'a> Visitor<'a> {
                     &engine,
                     telemetry,
                 ) {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        if result.0 != task_hash {
+                            rehashed_tasks.insert(info.clone());
+                        }
+                        result
+                    }
                     Err(e) => {
                         dispatch_error = Some(e);
                         break;
                     }
                 }
             } else {
-                dispatch_error = Some(Error::MissingDefinition);
-                break;
+                (task_hash, execution_env)
             };
 
             debug!("task {} hash is {}", info, task_hash);

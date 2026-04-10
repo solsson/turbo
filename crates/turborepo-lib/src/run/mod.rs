@@ -979,17 +979,22 @@ impl Run {
         // and won't produce output files, so upstream behavior is fine.
         let overlaps =
             turborepo_engine::dep_output_overlap::detect_dep_output_overlaps(&self.engine);
-        let deferred_hash_tasks: HashSet<TaskId<'static>> = overlaps
-            .iter()
-            .filter(|overlap| {
-                let dep_pkg = PackageName::from(overlap.dep_task_id.package());
-                self.pkg_dep_graph
-                    .package_info(&dep_pkg)
-                    .and_then(|info| info.package_json.scripts.get(overlap.dep_task_id.task()))
-                    .is_some()
-            })
-            .map(|o| o.task_id.clone())
-            .collect();
+        let mut deferred_hash_tasks: std::collections::HashMap<
+            TaskId<'static>,
+            Vec<TaskId<'static>>,
+        > = std::collections::HashMap::new();
+        for overlap in overlaps.iter().filter(|overlap| {
+            let dep_pkg = PackageName::from(overlap.dep_task_id.package());
+            self.pkg_dep_graph
+                .package_info(&dep_pkg)
+                .and_then(|info| info.package_json.scripts.get(overlap.dep_task_id.task()))
+                .is_some()
+        }) {
+            deferred_hash_tasks
+                .entry(overlap.task_id.clone())
+                .or_default()
+                .push(overlap.dep_task_id.clone());
+        }
 
         debug!(
             "dep-output flagged: {} overlaps, {} tasks deferred: {:?}",

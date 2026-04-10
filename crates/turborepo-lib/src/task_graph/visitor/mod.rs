@@ -62,8 +62,8 @@ pub struct Visitor<'a> {
     warnings: Arc<Mutex<Vec<TaskWarning>>>,
     micro_frontends_configs: Option<&'a MicrofrontendsConfigs>,
     /// Tasks whose file hashes must be re-computed after dependencies execute.
-    /// These are tasks whose inputs match a dependency's outputs.
-    deferred_hash_tasks: HashSet<TaskId<'static>>,
+    /// Maps each deferred task to the dependency tasks that triggered it.
+    deferred_hash_tasks: HashMap<TaskId<'static>, Vec<TaskId<'static>>>,
     scm: &'a SCM,
 }
 
@@ -137,7 +137,7 @@ impl<'a> Visitor<'a> {
         ui_sender: Option<UISender>,
         is_watch: bool,
         micro_frontends_configs: Option<&'a MicrofrontendsConfigs>,
-        deferred_hash_tasks: HashSet<TaskId<'static>>,
+        deferred_hash_tasks: HashMap<TaskId<'static>, Vec<TaskId<'static>>>,
         scm: &'a SCM,
     ) -> Self {
         let (task_hasher, color_cache, grouping_layer) = {
@@ -485,7 +485,7 @@ impl<'a> Visitor<'a> {
             // outputs, re-hash now that dependencies have executed and their
             // output files exist on disk. Also re-hash if any dependency was
             // itself re-hashed (its hash changed, invalidating ours).
-            let needs_rehash = self.deferred_hash_tasks.contains(&info)
+            let needs_rehash = self.deferred_hash_tasks.contains_key(&info)
                 || engine
                     .dependencies(&info)
                     .map(|deps| {
@@ -535,13 +535,16 @@ impl<'a> Visitor<'a> {
 
             // In dry mode, deferred tasks haven't had their dependencies
             // execute, so the hash is based on stale file state. Mark it
-            // in the tracker so dry run output shows <DEFERRED> instead
-            // of a misleading hash. In non-dry mode the hash is correct
-            // (deps executed) and the tracker keeps the real value.
-            if self.dry && self.deferred_hash_tasks.contains(&info) {
-                self.task_hasher
-                    .task_hash_tracker()
-                    .set_hash(&info, "<DEFERRED>");
+            // In dry mode, deferred tasks haven't had their dependencies
+            // execute, so the hash is based on stale file state. Show
+            // which dependency outputs this task depends on instead.
+            if self.dry {
+                if let Some(dep_tasks) = self.deferred_hash_tasks.get(&info) {
+                    let deps: Vec<_> = dep_tasks.iter().map(|d| d.to_string()).collect();
+                    self.task_hasher
+                        .task_hash_tracker()
+                        .set_hash(&info, &format!("<DEPENDS_ON_OUTPUT: {}>", deps.join(",")));
+                }
             }
 
             let task_cache = {

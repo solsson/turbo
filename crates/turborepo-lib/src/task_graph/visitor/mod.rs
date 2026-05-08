@@ -290,7 +290,7 @@ impl<'a> Visitor<'a> {
                     package_task_event.track_env_mode(&task_env_mode.to_string());
 
                     let task_hash_telemetry = package_task_event.child();
-                    let task_hash = self.task_hasher.calculate_task_hash(
+                    let mut task_hash = self.task_hasher.calculate_task_hash(
                         task_id,
                         task_definition,
                         task_env_mode,
@@ -298,6 +298,61 @@ impl<'a> Visitor<'a> {
                         &dependency_set,
                         task_hash_telemetry,
                     )?;
+
+                    // If --only dropped dependencies, hash their package
+                    // source files and fold into the task hash for cache
+                    // correctness. The dropped tasks don't execute, but
+                    // changes in their packages must still invalidate.
+                    if let Some(dropped) = engine.dropped_dependencies(task_id) {
+                        use turborepo_hash::TurboHash;
+                        let mut extra_hashes: Vec<String> = Vec::new();
+                        for dep_task_id in dropped {
+                            let dep_pkg = PackageName::from(dep_task_id.package());
+                            if let Some(dep_info) = self.package_graph.package_info(&dep_pkg) {
+                                let dep_path = dep_info
+                                    .package_json_path
+                                    .parent()
+                                    .unwrap_or_else(|| {
+                                        turbopath::AnchoredSystemPath::new("")
+                                            .unwrap()
+                                    });
+                                if let Ok(hashes) = self.scm.get_package_file_hashes(
+                                    self.repo_root,
+                                    dep_path,
+                                    &[] as &[&str],
+                                    true,
+                                    None,
+                                    None,
+                                ) {
+                                    let mut pairs: Vec<_> = hashes.into_iter().collect();
+                                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                                    let dep_hash = turborepo_hash::FileHashes(pairs).hash();
+                                    extra_hashes.push(format!("{}:{}", dep_task_id, dep_hash));
+                                }
+                            }
+                        }
+                        if !extra_hashes.is_empty() {
+                            extra_hashes.sort();
+                            // Combine original hash with dropped dep file hashes.
+                            // Use a simple deterministic scheme: concatenate all
+                            // hashes and produce a new hash via the same xxh64
+                            // that turbo uses internally.
+                            let mut combined = task_hash.clone();
+                            for h in &extra_hashes {
+                                combined.push('\n');
+                                combined.push_str(h);
+                            }
+                            let new_hash = turborepo_hash::hash_string(&combined);
+                            tracing::debug!(
+                                "--only: {} hash {} -> {} for dropped deps: {:?}",
+                                task_id,
+                                task_hash,
+                                new_hash,
+                                extra_hashes,
+                            );
+                            task_hash = new_hash;
+                        }
+                    }
 
                     let execution_env =
                         self.task_hasher

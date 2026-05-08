@@ -398,15 +398,15 @@ impl<'a, L: TurboJsonLoader> EngineBuilder<'a, L> {
                         if let Some(allowed_tasks) = &allowed_tasks
                             && !allowed_tasks.contains(&from_task_id)
                         {
-                            tracing::warn!(
-                                "--only: dropping topological dependency {} from {}. \
-                                 Changes in {} won't affect the cache key for {}. \
-                                 To include it, add --filter={}",
+                            tracing::debug!(
+                                "--only: {} excluded from execution but its inputs \
+                                 will still affect the cache key for {}",
                                 from_task_id,
                                 to_task_id,
-                                from_task_id.package(),
-                                to_task_id,
-                                from_task_id.package(),
+                            );
+                            engine.add_dropped_dependency(
+                                to_task_id.clone(),
+                                from_task_id.into_owned(),
                             );
                             return;
                         }
@@ -441,15 +441,15 @@ impl<'a, L: TurboJsonLoader> EngineBuilder<'a, L> {
                 if let Some(allowed_tasks) = &allowed_tasks
                     && !allowed_tasks.contains(&from_task_id)
                 {
-                    tracing::warn!(
-                        "--only: dropping task dependency {} from {}. \
-                         Changes in {} won't affect the cache key for {}. \
-                         To include it, add --filter={}",
+                    tracing::debug!(
+                        "--only: {} excluded from execution but its inputs \
+                         will still affect the cache key for {}",
                         from_task_id,
                         to_task_id,
-                        from_task_id.package(),
-                        to_task_id,
-                        from_task_id.package(),
+                    );
+                    engine.add_dropped_dependency(
+                        to_task_id.clone(),
+                        from_task_id,
                     );
                     continue;
                 }

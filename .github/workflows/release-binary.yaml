@@ -34,6 +34,8 @@ jobs:
         with:
           toolchain: nightly-2026-01-16
           targets: ${{ matrix.target }}
+      - name: Ensure cross-compilation target
+        run: rustup target add ${{ matrix.target }}
       - name: Install dependencies
         if: matrix.setup
         run: ${{ matrix.setup }}

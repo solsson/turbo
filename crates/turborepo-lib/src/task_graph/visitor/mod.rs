@@ -61,6 +61,11 @@ pub struct Visitor<'a> {
     ui_sender: Option<UISender>,
     warnings: Arc<Mutex<Vec<TaskWarning>>>,
     micro_frontends_configs: Option<&'a MicrofrontendsConfigs>,
+    /// Tasks whose file hashes must be re-computed after dependencies execute.
+    /// Tasks whose inputs depend on a dependency's outputs. Maps each task
+    /// to the dependency tasks that produce the matching outputs.
+    depends_on_output_tasks: HashMap<TaskId<'static>, Vec<TaskId<'static>>>,
+    scm: &'a SCM,
 }
 
 #[derive(Debug, thiserror::Error, Diagnostic)]
@@ -133,6 +138,8 @@ impl<'a> Visitor<'a> {
         ui_sender: Option<UISender>,
         is_watch: bool,
         micro_frontends_configs: Option<&'a MicrofrontendsConfigs>,
+        depends_on_output_tasks: HashMap<TaskId<'static>, Vec<TaskId<'static>>>,
+        scm: &'a SCM,
     ) -> Self {
         let (task_hasher, color_cache, grouping_layer) = {
             let _span = tracing::info_span!("visitor_new").entered();
@@ -191,6 +198,8 @@ impl<'a> Visitor<'a> {
             is_watch,
             warnings: Default::default(),
             micro_frontends_configs,
+            depends_on_output_tasks,
+            scm,
         }
     }
 
@@ -312,6 +321,71 @@ impl<'a> Visitor<'a> {
             .expect("mutex not poisoned"))
     }
 
+    /// Compute file hash and task hash for a depends-on-output task.
+    /// Called at dispatch time when all dependencies have executed and
+    /// their output files exist on disk.
+    fn compute_depends_on_output_hash(
+        &self,
+        task_id: &TaskId<'static>,
+        task_definition: &turborepo_types::TaskDefinition,
+        workspace_info: &turborepo_repository::package_graph::PackageInfo,
+        engine: &Engine,
+        telemetry: &GenericEventBuilder,
+    ) -> Result<(String, EnvironmentVariableMap), Error> {
+        use turborepo_hash::TurboHash;
+
+        // Re-compute file hash — the dependency's output files now exist.
+        let package_path = workspace_info
+            .package_json_path
+            .parent()
+            .unwrap_or_else(|| AnchoredSystemPath::new("").unwrap());
+        let inputs = &task_definition.inputs;
+        let file_hashes = self
+            .scm
+            .get_package_file_hashes(
+                self.repo_root,
+                package_path,
+                &inputs.globs,
+                inputs.default,
+                None,
+                None,
+            )
+            .map_err(|e| Error::TaskHash(task_hash::Error::Scm(e)))?;
+
+        let mut sorted: Vec<_> = file_hashes.into_iter().collect();
+        sorted.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        let hash = turborepo_hash::FileHashes(sorted).hash();
+
+        // Update the file hash in the TaskHasher. The hashes field uses
+        // RwLock so this is safe through &self.
+        self.task_hasher.update_file_hash(task_id, hash.clone());
+
+        debug!(
+            "depends-on-output {}: file hash recomputed to {}",
+            task_id, hash
+        );
+
+        let task_env_mode = task_definition.env_mode.unwrap_or(self.global_env_mode);
+        let dependency_set = engine
+            .dependencies(task_id)
+            .ok_or(Error::MissingDefinition)?;
+        let package_task_event =
+            PackageTaskEventBuilder::new(task_id.package(), task_id.task()).with_parent(telemetry);
+        let task_hash = self.task_hasher.calculate_task_hash(
+            task_id,
+            task_definition,
+            task_env_mode,
+            workspace_info,
+            &dependency_set,
+            package_task_event.child(),
+        )?;
+        let execution_env = self
+            .task_hasher
+            .env(task_id, task_env_mode, task_definition)?;
+
+        Ok((task_hash, execution_env))
+    }
+
     #[tracing::instrument(skip_all)]
     pub async fn visit(
         &self,
@@ -344,6 +418,9 @@ impl<'a> Visitor<'a> {
         let span = Span::current();
 
         let factory = ExecContextFactory::new(self, errors.clone(), self.manager.clone(), &engine)?;
+        // Track tasks whose hash changed at dispatch time (depends-on-output),
+        // so downstream tasks can detect they also need re-hashing.
+        let mut output_changed_tasks: HashSet<TaskId<'static>> = HashSet::new();
 
         // Errors from the dispatch loop are captured here rather than returned
         // immediately. This ensures we always drain the FuturesUnordered below,
@@ -399,14 +476,74 @@ impl<'a> Visitor<'a> {
                 break;
             };
 
-            // Move pre-computed hash and env out of the map — each task is
-            // dispatched exactly once, so remove avoids cloning the env map.
+            // Move pre-computed hash and env out of the map.
             let Some((task_hash, execution_env)) = precomputed.remove(&info) else {
                 dispatch_error = Some(Error::MissingDefinition);
                 break;
             };
 
+            // Deferred hashing: if this task's inputs match a dependency's
+            // outputs, re-hash now that dependencies have executed and their
+            // output files exist on disk. Also re-hash if any dependency was
+            // itself re-hashed (its hash changed, invalidating ours).
+            let needs_output_rehash = self.depends_on_output_tasks.contains_key(&info)
+                || engine
+                    .dependencies(&info)
+                    .map(|deps| {
+                        deps.iter().any(|d| {
+                            if let turborepo_engine::TaskNode::Task(dep_id) = d {
+                                output_changed_tasks.contains(dep_id)
+                            } else {
+                                false
+                            }
+                        })
+                    })
+                    .unwrap_or(false);
+
+            let (task_hash, execution_env) = if needs_output_rehash {
+                match self.compute_depends_on_output_hash(
+                    &info,
+                    task_definition,
+                    workspace_info,
+                    &engine,
+                    telemetry,
+                ) {
+                    Ok(result) => {
+                        if result.0 != task_hash {
+                            debug!(
+                                "depends-on-output {}: hash changed {} -> {}",
+                                info, task_hash, result.0
+                            );
+                            output_changed_tasks.insert(info.clone());
+                        } else {
+                            debug!("depends-on-output {}: hash unchanged ({})", info, task_hash);
+                        }
+                        result
+                    }
+                    Err(e) => {
+                        dispatch_error = Some(e);
+                        break;
+                    }
+                }
+            } else {
+                (task_hash, execution_env)
+            };
+
             debug!("task {} hash is {}", info, task_hash);
+
+            // In dry mode, deferred tasks haven't had their dependencies
+            // execute, so the hash is based on stale file state. Mark it
+            // In dry mode, depends-on-output tasks haven't had their
+            // dependencies execute, so the hash is based on stale file
+            // state. Show which dependency outputs the task depends on.
+            if self.dry {
+                if let Some(dep_tasks) = self.depends_on_output_tasks.get(&info) {
+                    let deps: Vec<_> = dep_tasks.iter().map(|d| d.to_string()).collect();
+                    self.task_hasher
+                        .task_hash_tracker()
+                        .set_hash(&info, &format!("<DEPENDS_ON_OUTPUT: {}>", deps.join(",")));
+                }
+            }
 
             let task_cache = {
                 let _span = tracing::info_span!("task_cache_new").entered();

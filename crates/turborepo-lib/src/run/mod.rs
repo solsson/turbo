@@ -38,6 +38,7 @@ pub use turborepo_run_cache::{ConfigCache, RunCache, TaskCache};
 use turborepo_run_summary::{ObservabilityHandle, RunTracker};
 use turborepo_scm::{RepoGitIndex, SCM};
 use turborepo_signals::{listeners::get_signal, ShutdownReason, SignalHandler};
+use turborepo_task_id::TaskId;
 use turborepo_telemetry::events::generic::GenericEventBuilder;
 use turborepo_types::{EnvMode, UIMode};
 use turborepo_ui::{sender::UISender, tui, tui::TuiSender, wui::sender::WebUISender, ColorConfig};
@@ -429,6 +430,25 @@ impl Run {
             "",
         )
         .emit();
+
+        // Config-level flagging for dependsOn output/input overlaps.
+        // Deduplicated by task name (package stripped) — informs the config
+        // author that turbo.json task definitions have patterns where a
+        // task's inputs match a dependency's outputs.
+        let overlaps =
+            turborepo_engine::dep_output_overlap::detect_dep_output_overlaps(&self.engine);
+        let config_overlaps =
+            turborepo_engine::dep_output_overlap::config_level_overlaps(&overlaps);
+        for co in &config_overlaps {
+            turborepo_log::info(
+                turborepo_log::Source::turbo(turborepo_log::Subsystem::Run),
+                format!(
+                    "{pad}Task \"{}\" inputs match \"{}\" outputs: {:?}",
+                    co.task_name, co.dep_task_name, co.overlapping_patterns
+                ),
+            )
+            .emit();
+        }
     }
 
     pub fn turbo_json_loader(&self) -> &UnifiedTurboJsonLoader {
@@ -953,6 +973,36 @@ impl Run {
 
         let env_mode = self.opts.run_opts.env_mode;
 
+        // Config flagging identified input/output overlaps. Build the
+        // depends-on-output set: only include tasks where the dependency
+        // task has a script — if the dep has no script, the task is a
+        // no-op and won't produce output files, so upstream behavior is fine.
+        let overlaps =
+            turborepo_engine::dep_output_overlap::detect_dep_output_overlaps(&self.engine);
+        let mut depends_on_output_tasks: std::collections::HashMap<
+            TaskId<'static>,
+            Vec<TaskId<'static>>,
+        > = std::collections::HashMap::new();
+        for overlap in overlaps.iter().filter(|overlap| {
+            let dep_pkg = PackageName::from(overlap.dep_task_id.package());
+            self.pkg_dep_graph
+                .package_info(&dep_pkg)
+                .and_then(|info| info.package_json.scripts.get(overlap.dep_task_id.task()))
+                .is_some()
+        }) {
+            depends_on_output_tasks
+                .entry(overlap.task_id.clone())
+                .or_default()
+                .push(overlap.dep_task_id.clone());
+        }
+
+        debug!(
+            "dep-output flagged: {} overlaps, {} depends-on-output tasks: {:?}",
+            overlaps.len(),
+            depends_on_output_tasks.len(),
+            depends_on_output_tasks
+        );
+
         let mut file_hash_result = None;
         let mut internal_deps_result = None;
         let mut global_file_result = None;
@@ -1083,6 +1133,8 @@ impl Run {
             ui_sender,
             is_watch,
             self.micro_frontend_configs.as_ref(),
+            depends_on_output_tasks,
+            &self.scm,
         )
         .await;
 

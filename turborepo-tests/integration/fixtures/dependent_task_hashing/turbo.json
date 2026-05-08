@@ -1,0 +1,10 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "prepare": {},
+    "transform": {},
+    "build": {},
+    "schemas": {},
+    "checks": {}
+  }
+}

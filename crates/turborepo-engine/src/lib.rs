@@ -12,6 +12,7 @@ pub mod affected;
 mod builder;
 mod builder_error;
 mod builder_errors;
+pub mod dep_output_overlap;
 mod dot;
 mod execute;
 mod graph_visualizer;
@@ -128,6 +129,10 @@ pub struct Engine<S = Built, T: TaskDefinitionInfo = TaskInfo> {
     task_locations: HashMap<TaskId<'static>, Spanned<()>>,
     package_tasks: HashMap<PackageName, Vec<petgraph::graph::NodeIndex>>,
     pub has_non_interruptible_tasks: bool,
+    /// Dependencies dropped by --only that should still affect the cache key.
+    /// Maps task -> list of dependency tasks that were excluded from execution
+    /// but whose package inputs should be hashed for cache correctness.
+    dropped_dependencies: HashMap<TaskId<'static>, Vec<TaskId<'static>>>,
 }
 
 /// Simple struct containing just the task definition fields needed by the
@@ -165,6 +170,7 @@ impl<T: TaskDefinitionInfo + Default + Clone> Engine<Building, T> {
             task_locations: HashMap::default(),
             package_tasks: HashMap::default(),
             has_non_interruptible_tasks: false,
+            dropped_dependencies: HashMap::default(),
         }
     }
 
@@ -216,6 +222,7 @@ impl<T: TaskDefinitionInfo + Default + Clone> Engine<Building, T> {
             task_locations,
             package_tasks,
             has_non_interruptible_tasks,
+            dropped_dependencies,
             ..
         } = self;
         Engine {
@@ -227,6 +234,7 @@ impl<T: TaskDefinitionInfo + Default + Clone> Engine<Building, T> {
             task_locations,
             package_tasks,
             has_non_interruptible_tasks,
+            dropped_dependencies,
         }
     }
 
@@ -234,6 +242,19 @@ impl<T: TaskDefinitionInfo + Default + Clone> Engine<Building, T> {
     /// Use with care - prefer using the builder methods when possible.
     pub fn task_graph_mut(&mut self) -> &mut Graph<TaskNode, ()> {
         &mut self.task_graph
+    }
+
+    /// Records a dependency that was dropped by --only but should still
+    /// affect the cache key of the downstream task.
+    pub fn add_dropped_dependency(
+        &mut self,
+        task_id: TaskId<'static>,
+        dropped_dep: TaskId<'static>,
+    ) {
+        self.dropped_dependencies
+            .entry(task_id)
+            .or_default()
+            .push(dropped_dep);
     }
 }
 
@@ -244,6 +265,16 @@ impl<T: TaskDefinitionInfo + Default + Clone> Default for Engine<Building, T> {
 }
 
 impl<T: TaskDefinitionInfo + Clone> Engine<Built, T> {
+    /// Returns dependencies that were dropped by --only but should still
+    /// contribute to the cache key. The returned task IDs identify upstream
+    /// packages whose source inputs should be hashed.
+    pub fn dropped_dependencies(
+        &self,
+        task_id: &TaskId<'static>,
+    ) -> Option<&Vec<TaskId<'static>>> {
+        self.dropped_dependencies.get(task_id)
+    }
+
     /// Creates an engine containing only tasks reachable from the given
     /// packages: their direct tasks, transitive dependents, and cacheable
     /// transitive dependencies needed for execution. Persistent

@@ -1,0 +1,8 @@
+{
+  "name": "depends-on-deferred",
+  "scripts": {
+    "prepare": "echo Preparing && echo foo > generated.txt",
+    "schemas": "echo Schemas",
+    "checks": "echo Checks"
+  }
+}

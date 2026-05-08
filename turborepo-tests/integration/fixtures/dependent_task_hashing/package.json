@@ -1,0 +1,5 @@
+{
+  "name": "dependent-task-hashing",
+  "private": true,
+  "workspaces": ["packages/*"]
+}

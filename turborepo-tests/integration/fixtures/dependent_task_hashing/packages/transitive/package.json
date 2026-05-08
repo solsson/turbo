@@ -1,0 +1,8 @@
+{
+  "name": "transitive",
+  "scripts": {
+    "prepare": "echo Preparing && echo foo > generated.txt",
+    "transform": "echo Transforming && cat generated.txt > transformed.txt",
+    "build": "echo Building"
+  }
+}

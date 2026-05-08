@@ -12,6 +12,14 @@ use std::{collections::HashMap, sync::Arc};
 use capnp::message::{Builder, HeapAllocator};
 pub use oid_hash::OidHash;
 pub use traits::TurboHash;
+
+/// Hashes a string using the same xxHash64 algorithm turbo uses internally.
+/// Returns a 16-character hex string.
+pub fn hash_string(s: &str) -> String {
+    let out = xxhash_rust::xxh64::xxh64(s.as_bytes(), 0);
+    hex::encode(out.to_be_bytes())
+}
+
 // Re-export for backward compatibility. New code should import from `turborepo_types`.
 #[deprecated(
     since = "2.4.0",

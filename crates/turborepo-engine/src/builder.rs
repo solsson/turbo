@@ -474,6 +474,20 @@ impl<'a, L: TurboJsonLoader> EngineBuilder<'a, L> {
                         if let Some(allowed_tasks) = &allowed_tasks
                             && !allowed_tasks.contains(&from_task_id)
                         {
+                            // `--only` excludes this task from execution, but
+                            // the package's sources must still invalidate our
+                            // cache entry. Record the edge so the visitor can
+                            // fold the package's file hashes into the hash.
+                            tracing::debug!(
+                                "--only dropped topological dependency {} of {}; its package \
+                                 inputs will still affect the cache key",
+                                from_task_id,
+                                to_task_id,
+                            );
+                            engine.add_dropped_dependency(
+                                to_task_id.clone(),
+                                from_task_id.into_owned(),
+                            );
                             return;
                         }
                         let from_task_index = engine.get_index(&from_task_id);
@@ -513,6 +527,13 @@ impl<'a, L: TurboJsonLoader> EngineBuilder<'a, L> {
                 if let Some(allowed_tasks) = &allowed_tasks
                     && !allowed_tasks.contains(&from_task_id)
                 {
+                    tracing::debug!(
+                        "--only dropped dependency {} of {}; its package inputs will still affect \
+                         the cache key",
+                        from_task_id,
+                        to_task_id,
+                    );
+                    engine.add_dropped_dependency(to_task_id.clone(), from_task_id);
                     continue;
                 }
                 has_deps = true;

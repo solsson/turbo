@@ -229,6 +229,7 @@ impl<'a> Visitor<'a> {
         micro_frontends_configs: Option<&'a MicrofrontendsConfigs>,
         external_deps_hashes: Option<HashMap<String, String>>,
         compile_cache_endpoint: Option<CompileCacheEndpoint>,
+        dropped_dependency_hashes: crate::run::only_cache::DroppedDependencyHashes,
     ) -> Self {
         let (task_hasher, color_cache, grouping_layer) = {
             let _span = tracing::info_span!("visitor_new").entered();
@@ -240,6 +241,10 @@ impl<'a> Visitor<'a> {
                 global_env,
                 global_env_patterns,
             );
+
+            if !dropped_dependency_hashes.is_empty() {
+                task_hasher.set_dropped_dependency_hashes(dropped_dependency_hashes);
+            }
 
             // The caller may have computed the external dependency hashes
             // concurrently with other startup work; fall back to computing

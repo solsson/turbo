@@ -2,6 +2,7 @@
 
 pub mod builder;
 mod error;
+pub(crate) mod only_cache;
 pub(crate) mod package_discovery;
 pub(crate) mod scope;
 pub mod task_access;
@@ -1291,6 +1292,25 @@ impl Run {
                 None => (None, None, None),
             };
 
+        // `--only` drops dependency edges for tasks outside the filter set.
+        // Hash the excluded packages so their sources still invalidate the
+        // cache, and tell the user which tasks were left out.
+        let (dropped_dependency_hashes, dropped_dependencies) =
+            only_cache::compute_dropped_dependency_hashes(
+                &self.engine,
+                &self.pkg_dep_graph,
+                &self.scm,
+                &self.repo_root,
+                repo_index,
+            );
+        if let Some(warning) = only_cache::dropped_dependency_warning(&dropped_dependencies) {
+            turborepo_log::warn(
+                turborepo_log::Source::turbo(turborepo_log::Subsystem::Run),
+                warning,
+            )
+            .emit();
+        }
+
         let mut visitor = Visitor::new(
             self.pkg_dep_graph.clone(),
             self.run_cache.clone(),
@@ -1312,6 +1332,7 @@ impl Run {
             self.micro_frontend_configs.as_ref(),
             external_deps_hashes,
             compile_cache_endpoint,
+            dropped_dependency_hashes,
         )
         .await;
 

@@ -677,6 +677,192 @@ fn test_engine_tasks_only_task_dep() {
     assert_eq!(all_dependencies(&engine), expected);
 }
 
+/// `--only` drops the `^build` edge to `a`, but `a`'s sources must still reach
+/// `b#build`'s cache key. The engine records the dropped edge so the visitor
+/// can hash `a`'s package files in place of the task hash `a#build` never
+/// produced.
+#[test]
+fn test_engine_tasks_only_records_dropped_topological_dependency() {
+    let repo_root_dir = TempDir::with_prefix("repo").unwrap();
+    let repo_root = AbsoluteSystemPathBuf::new(repo_root_dir.path().to_str().unwrap()).unwrap();
+    let package_graph = mock_package_graph(
+        &repo_root,
+        package_jsons! {
+            repo_root,
+            "a" => [],
+            "b" => ["a"]
+        },
+    );
+    let turbo_jsons = vec![(
+        PackageName::Root,
+        turbo_json(json!({
+            "tasks": {
+                "build": { "dependsOn": ["^build"] },
+            }
+        })),
+    )]
+    .into_iter()
+    .collect();
+    let loader = TestTurboJsonLoader::new(turbo_jsons);
+    let engine = EngineBuilder::new(&repo_root, &package_graph, &loader, false)
+        .with_tasks_only(true)
+        .with_tasks(Some(Spanned::new(TaskName::from("build"))))
+        .with_workspaces(vec![PackageName::from("b")])
+        .with_root_tasks(vec![TaskName::from("build")])
+        .build()
+        .unwrap();
+
+    let b_build = TaskId::try_from("b#build").unwrap();
+    let a_build = TaskId::try_from("a#build").unwrap();
+    assert_eq!(
+        engine.dropped_dependencies(&b_build),
+        Some([a_build].as_slice()),
+        "--only must record the dropped ^build edge so a's sources still affect b#build's cache \
+         key",
+    );
+}
+
+/// Same contract as above for an explicit `a#build` dependency rather than a
+/// topological one -- these are two separate code paths in the builder.
+#[test]
+fn test_engine_tasks_only_records_dropped_task_dependency() {
+    let repo_root_dir = TempDir::with_prefix("repo").unwrap();
+    let repo_root = AbsoluteSystemPathBuf::new(repo_root_dir.path().to_str().unwrap()).unwrap();
+    let package_graph = mock_package_graph(
+        &repo_root,
+        package_jsons! {
+            repo_root,
+            "a" => [],
+            "b" => []
+        },
+    );
+    let turbo_jsons = vec![(
+        PackageName::Root,
+        turbo_json(json!({
+            "tasks": {
+                "a#build": { },
+                "b#build": { "dependsOn": ["a#build"] }
+            }
+        })),
+    )]
+    .into_iter()
+    .collect();
+    let loader = TestTurboJsonLoader::new(turbo_jsons);
+    let engine = EngineBuilder::new(&repo_root, &package_graph, &loader, false)
+        .with_tasks_only(true)
+        .with_tasks(Some(Spanned::new(TaskName::from("build"))))
+        .with_workspaces(vec![PackageName::from("b")])
+        .with_root_tasks(vec![TaskName::from("build")])
+        .build()
+        .unwrap();
+
+    let b_build = TaskId::try_from("b#build").unwrap();
+    let a_build = TaskId::try_from("a#build").unwrap();
+    assert_eq!(
+        engine.dropped_dependencies(&b_build),
+        Some([a_build].as_slice()),
+    );
+}
+
+/// A task with no dropped edges must record nothing, so the common path stays
+/// free of the extra dependency-hash material.
+#[test]
+fn test_engine_records_no_dropped_dependencies_without_tasks_only() {
+    let repo_root_dir = TempDir::with_prefix("repo").unwrap();
+    let repo_root = AbsoluteSystemPathBuf::new(repo_root_dir.path().to_str().unwrap()).unwrap();
+    let package_graph = mock_package_graph(
+        &repo_root,
+        package_jsons! {
+            repo_root,
+            "a" => [],
+            "b" => ["a"]
+        },
+    );
+    let turbo_jsons = vec![(
+        PackageName::Root,
+        turbo_json(json!({
+            "tasks": {
+                "build": { "dependsOn": ["^build"] },
+            }
+        })),
+    )]
+    .into_iter()
+    .collect();
+    let loader = TestTurboJsonLoader::new(turbo_jsons);
+    let engine = EngineBuilder::new(&repo_root, &package_graph, &loader, false)
+        .with_tasks(Some(Spanned::new(TaskName::from("build"))))
+        .with_workspaces(vec![PackageName::from("b")])
+        .with_root_tasks(vec![TaskName::from("build")])
+        .build()
+        .unwrap();
+
+    let b_build = TaskId::try_from("b#build").unwrap();
+    assert_eq!(engine.dropped_dependencies(&b_build), None);
+}
+
+/// Tripwire, not a bug report.
+///
+/// `--only` deliberately drops every dependency edge that points outside the
+/// filter set, including `^` edges to direct `package.json` dependencies. We do
+/// not try to change that -- altering which nodes survive the filter would
+/// change documented `--only` semantics and would conflict with upstream on
+/// every rebase. Instead we compensate in the cache key; see
+/// `crates/turborepo-lib/src/run/only_cache.rs` and the two tests above.
+///
+/// This test asserts the edge *is* dropped, phrased as the behavior we would
+/// want if edges were preserved, so that it starts failing the day upstream
+/// changes its mind. If it does, revisit whether the compensation is still
+/// needed.
+#[test]
+#[should_panic(expected = "assertion `left == right` failed")]
+fn test_tasks_only_drops_package_dependency_edges() {
+    let repo_root_dir = TempDir::with_prefix("repo").unwrap();
+    let repo_root = AbsoluteSystemPathBuf::new(repo_root_dir.path().to_str().unwrap()).unwrap();
+    let package_graph = mock_package_graph(
+        &repo_root,
+        package_jsons! {
+            repo_root,
+            "types" => [],
+            "runtime" => ["types"]
+        },
+    );
+    let turbo_jsons = vec![(
+        PackageName::Root,
+        turbo_json(json!({
+            "tasks": {
+                "fetch": {
+                    "cache": false,
+                    "outputs": ["target-fetched/**"]
+                },
+                "bundle": {
+                    "dependsOn": ["fetch", "^bundle"],
+                    "inputs": ["target-fetched/**"],
+                    "outputs": ["target/**"]
+                }
+            }
+        })),
+    )]
+    .into_iter()
+    .collect();
+    let loader = TestTurboJsonLoader::new(turbo_jsons);
+
+    let engine = EngineBuilder::new(&repo_root, &package_graph, &loader, false)
+        .with_tasks_only(true)
+        .with_tasks(Some(Spanned::new(TaskName::from("bundle"))))
+        .with_workspaces(vec![PackageName::from("runtime")])
+        .with_root_tasks(vec![TaskName::from("fetch"), TaskName::from("bundle")])
+        .build()
+        .unwrap();
+
+    // What we would assert if --only preserved ^bundle edges for package.json
+    // dependencies. It does not, so this fails -- by design.
+    let expected = deps! {
+        "runtime#bundle" => ["types#bundle"],
+        "types#bundle" => ["___ROOT___"]
+    };
+    assert_eq!(all_dependencies(&engine), expected);
+}
+
 // Note: test_validate_task_name has been moved to turborepo-engine crate
 // See: crates/turborepo-engine/src/validate.rs
 

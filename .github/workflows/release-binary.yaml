@@ -1,0 +1,136 @@
+name: Release Binary
+
+# Builds `turbo` for the four targets we deploy and attaches them to the GitHub
+# release for the pushed tag.
+#
+# The setup steps deliberately mirror the `build-rust` job in
+# .github/workflows/turborepo-release.yml rather than hand-rolling toolchain
+# installation. Upstream's composite actions already encode the versions and
+# workarounds this build needs, and reusing them means a rebase picks up their
+# fixes instead of silently drifting. Every previous CI failure on this fork came
+# from hand-rolling a step that upstream already solved.
+
+on:
+  push:
+    tags: ["*"]
+  # Lets us smoke-test this workflow without burning a tag. To validate a change
+  # cheaply, temporarily reduce `matrix.settings` to one entry and dispatch;
+  # a full four-target run is only needed for an actual release.
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      # Publish whatever targets succeed rather than losing the whole release to
+      # one flaky cross-compilation job.
+      fail-fast: false
+      matrix:
+        settings:
+          - host: macos-15
+            target: "x86_64-apple-darwin"
+            short: darwin-amd64
+          - host: macos-15
+            target: "aarch64-apple-darwin"
+            short: darwin-arm64
+          - host: ubuntu-24.04
+            target: "x86_64-unknown-linux-musl"
+            short: linux-amd64
+            setup: "sudo apt-get update && sudo apt-get install -y build-essential clang lldb llvm libclang-dev curl musl-tools sudo unzip"
+          - host: ubuntu-24.04
+            target: "aarch64-unknown-linux-musl"
+            short: linux-arm64
+            # clang sees glibc 2.39 headers when compiling aws-lc-sys C code,
+            # but the final static link uses musl, which only exports the base symbols.
+            rust-build-env: 'CC_aarch64_unknown_linux_musl=clang AR_aarch64_unknown_linux_musl=llvm-ar RUSTFLAGS="-Clink-self-contained=yes -Clinker=rust-lld -Clink-arg=--defsym=__isoc23_sscanf=sscanf -Clink-arg=--defsym=__isoc23_strtol=strtol"'
+            setup: "sudo apt-get update && sudo apt-get install -y build-essential musl-tools clang llvm gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu"
+    runs-on: ${{ matrix.settings.host }}
+    # Upstream allows 45 on larger runners; these are standard runners building
+    # from cold with no cargo cache, and they also compile ghostty from source.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Setup Protoc
+        uses: ./.github/actions/setup-protoc
+        with:
+          version: "26.x"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup capnproto
+        uses: ./.github/actions/setup-capnproto
+
+      # Respects rust-toolchain.toml, so there is no toolchain version pinned
+      # here to drift out of sync on rebase.
+      - name: Rust Setup
+        uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1
+        with:
+          target: ${{ matrix.settings.target }}
+          # needed to not make it override the defaults
+          rustflags: ""
+          # we want more specific settings
+          cache: false
+
+      # Builds libghostty-vt (the TUI terminal emulator) from source. Pinned by
+      # the action itself; do not substitute a third-party zig installer.
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+
+      - name: Build Setup
+        if: ${{ matrix.settings.setup }}
+        run: ${{ matrix.settings.setup }}
+
+      - name: Build
+        run: ${{ matrix.settings.rust-build-env }} cargo build --profile release-turborepo -p turbo --target ${{ matrix.settings.target }}
+
+      - name: Prepare artifact
+        run: cp target/${{ matrix.settings.target }}/release-turborepo/turbo turbo-${{ matrix.settings.short }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turbo-${{ matrix.settings.short }}
+          path: turbo-${{ matrix.settings.short }}
+
+  release:
+    needs: build
+    # `build` uses fail-fast: false, so publish whatever succeeded rather than
+    # losing three good binaries to one bad target. Skipped entirely for
+    # workflow_dispatch runs, which have no tag to attach a release to.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        id: checksums
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p artifacts
+          cd artifacts
+          binaries=(turbo-*)
+          if [ ${#binaries[@]} -eq 0 ]; then
+            echo "::error::No binaries were produced -- every build target failed."
+            exit 1
+          fi
+          sha256sum "${binaries[@]}" > checksums-sha256.txt
+          echo "count=${#binaries[@]}" >> "$GITHUB_OUTPUT"
+          cat checksums-sha256.txt
+
+      - name: Warn on partial release
+        if: ${{ steps.checksums.outputs.count != '4' }}
+        run: echo "::warning::Only ${{ steps.checksums.outputs.count }} of 4 targets produced a binary; this release is incomplete."
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/turbo-*
+            artifacts/checksums-sha256.txt

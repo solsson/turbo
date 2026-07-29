@@ -128,6 +128,15 @@ pub struct Engine<S = Built, T: TaskDefinitionInfo = TaskInfo> {
     task_locations: HashMap<TaskId<'static>, Spanned<()>>,
     package_tasks: HashMap<PackageName, Vec<petgraph::graph::NodeIndex>>,
     pub has_non_interruptible_tasks: bool,
+    /// Dependencies dropped by `--only` that must still affect the cache key.
+    ///
+    /// `--only` removes dependency edges for tasks outside the filter set, so
+    /// those tasks never execute and never contribute a task hash. Without
+    /// compensation the downstream task keeps hitting cache even when the
+    /// excluded package's sources changed. We record the dropped edges here so
+    /// the visitor can fold the excluded packages' file hashes into the
+    /// downstream task hash.
+    dropped_dependencies: HashMap<TaskId<'static>, Vec<TaskId<'static>>>,
 }
 
 /// Simple struct containing just the task definition fields needed by the
@@ -165,6 +174,7 @@ impl<T: TaskDefinitionInfo + Default + Clone> Engine<Building, T> {
             task_locations: HashMap::default(),
             package_tasks: HashMap::default(),
             has_non_interruptible_tasks: false,
+            dropped_dependencies: HashMap::default(),
         }
     }
 
@@ -227,6 +237,7 @@ impl<T: TaskDefinitionInfo + Default + Clone> Engine<Building, T> {
             task_locations,
             package_tasks,
             has_non_interruptible_tasks,
+            dropped_dependencies,
             ..
         } = self;
         Engine {
@@ -238,6 +249,7 @@ impl<T: TaskDefinitionInfo + Default + Clone> Engine<Building, T> {
             task_locations,
             package_tasks,
             has_non_interruptible_tasks,
+            dropped_dependencies,
         }
     }
 
@@ -245,6 +257,22 @@ impl<T: TaskDefinitionInfo + Default + Clone> Engine<Building, T> {
     /// Use with care - prefer using the builder methods when possible.
     pub fn task_graph_mut(&mut self) -> &mut Graph<TaskNode, ()> {
         &mut self.task_graph
+    }
+
+    /// Records a dependency edge that `--only` removed from the graph but that
+    /// must still contribute to `task_id`'s cache key.
+    pub fn add_dropped_dependency(
+        &mut self,
+        task_id: TaskId<'static>,
+        dropped_dep: TaskId<'static>,
+    ) {
+        let dropped = self.dropped_dependencies.entry(task_id).or_default();
+        // The same edge can be reached more than once while walking the graph
+        // (a package may be both a topological and a direct dependency).
+        // Duplicates would be hashed twice, so keep the list a set.
+        if !dropped.contains(&dropped_dep) {
+            dropped.push(dropped_dep);
+        }
     }
 }
 
@@ -255,6 +283,16 @@ impl<T: TaskDefinitionInfo + Default + Clone> Default for Engine<Building, T> {
 }
 
 impl<T: TaskDefinitionInfo + Clone> Engine<Built, T> {
+    /// Returns the dependency edges `--only` dropped for `task_id`, if any.
+    ///
+    /// The returned task IDs identify the excluded upstream packages whose
+    /// source files still need to be reflected in `task_id`'s cache key.
+    pub fn dropped_dependencies(&self, task_id: &TaskId<'static>) -> Option<&[TaskId<'static>]> {
+        self.dropped_dependencies
+            .get(task_id)
+            .map(|dropped| dropped.as_slice())
+    }
+
     /// Returns dependency task nodes selected by `dependencyOutputs` for
     /// `task_id`.
     ///
@@ -582,7 +620,8 @@ impl<T: TaskDefinitionInfo + Clone> Engine<Built, T> {
 
     /// Prunes the engine graph to only nodes in `reachable` and rebuilds all
     /// metadata (`task_lookup`, `root_index`, `task_definitions`,
-    /// `task_locations`, `package_tasks`, `has_non_interruptible_tasks`).
+    /// `task_locations`, `package_tasks`, `has_non_interruptible_tasks`,
+    /// `dropped_dependencies`).
     ///
     /// When `exclude_non_interruptible_persistent` is true, persistent
     /// non-interruptible tasks are also filtered out even if reachable (used
@@ -636,6 +675,12 @@ impl<T: TaskDefinitionInfo + Clone> Engine<Built, T> {
         self.task_definitions
             .retain(|id, _| self.task_lookup.contains_key(id));
         self.task_locations
+            .retain(|id, _| self.task_lookup.contains_key(id));
+        // Keyed by the *downstream* task, which must still be in the graph for
+        // the compensation to matter. The dropped dependencies themselves are
+        // deliberately absent from `task_lookup` -- that is what makes them
+        // dropped -- so they must not be filtered on.
+        self.dropped_dependencies
             .retain(|id, _| self.task_lookup.contains_key(id));
 
         self.package_tasks =

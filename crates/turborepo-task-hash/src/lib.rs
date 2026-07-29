@@ -298,6 +298,9 @@ pub struct TaskHasher<'a, R> {
     /// Builtin pass-through env vars matched against the environment once at
     /// construction; the set is invariant for the lifetime of the hasher.
     builtin_pass_through_env: EnvironmentVariableMap,
+    /// Stand-in dependency hashes for edges that `--only` dropped, keyed by the
+    /// downstream task. Populated once before the run; empty otherwise.
+    dropped_dependency_hashes: HashMap<TaskId<'static>, Vec<Arc<str>>>,
     /// Memoized wildcard matches so tasks sharing the same `env` or
     /// `passThroughEnv` patterns don't recompile regexes and rescan the
     /// environment.
@@ -333,9 +336,23 @@ impl<'a, R: RunOptsHashInfo> TaskHasher<'a, R> {
             global_env_patterns,
             task_hash_tracker: TaskHashTracker::new(expanded_hashes),
             builtin_pass_through_env,
+            dropped_dependency_hashes: HashMap::new(),
             wildcard_cache: WildcardMapCache::default(),
             external_deps_hash_cache: HashMap::new(),
         }
+    }
+
+    /// Installs stand-in dependency hashes for edges dropped by `--only`.
+    ///
+    /// Must be called before hashing begins. These are mixed in alongside the
+    /// real dependency hashes, so the resulting task hash -- including the copy
+    /// recorded in the tracker -- already accounts for the excluded packages
+    /// and propagates to dependents normally.
+    pub fn set_dropped_dependency_hashes(
+        &mut self,
+        dropped_dependency_hashes: HashMap<TaskId<'static>, Vec<Arc<str>>>,
+    ) {
+        self.dropped_dependency_hashes = dropped_dependency_hashes;
     }
 
     /// Pre-compute and cache external dependency hashes for all packages.
@@ -507,8 +524,18 @@ impl<'a, R: RunOptsHashInfo> TaskHasher<'a, R> {
             self.calculate_env_vars(task_id, task_definition, task_env_mode, framework)?;
 
         let outputs = task_definition.hashable_outputs(task_id);
-        let task_dependency_hashes =
+        let mut task_dependency_hashes =
             self.calculate_dependency_hashes(dependency_set, excluded_dependency_hashes)?;
+        // Dependencies that `--only` removed from the graph contribute the hash
+        // of their package sources in place of the task hash they never got to
+        // produce. Mixing them in here rather than adjusting the finished task
+        // hash keeps the tracker's copy compensated too, so dependents of this
+        // task also invalidate when an excluded package changes.
+        if let Some(dropped) = self.dropped_dependency_hashes.get(task_id) {
+            task_dependency_hashes.extend(dropped.iter().cloned());
+            task_dependency_hashes.sort_unstable();
+            task_dependency_hashes.dedup();
+        }
         let ext_hash_fallback;
         let external_deps_hash: Option<&str> = if !is_monorepo {
             None
